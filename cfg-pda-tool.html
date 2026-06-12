@@ -1,0 +1,1802 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CFG / PDA Simulator</title>
+<script src="https://cdn.jsdelivr.net/npm/neo4j-driver@5/lib/browser/neo4j-web.min.js"></script>
+<script>
+// ════════════════════════════════════════════════════════
+//  NEO4J STATE
+// ════════════════════════════════════════════════════════
+let globalDriver = null;
+let savedPDAs    = [];   // [{id, name, desc}]
+
+function v(id){ return document.getElementById(id)?.value||''; }
+
+// ── Connection panel toggle ─────────────────────────────
+function toggleConnPanel(){
+  const btn    = document.getElementById('conn-panel-toggle');
+  const fields = document.getElementById('conn-fields');
+  btn.classList.toggle('open');
+  fields.classList.toggle('open');
+}
+
+// ── Restore saved password ──────────────────────────────
+window.addEventListener('DOMContentLoaded', ()=>{
+  const p = localStorage.getItem('pda_neo4j_pass');
+  if(p){ const el=document.getElementById('neo4j-pass'); if(el) el.value=p; }
+});
+
+// ── Connect & fetch saved PDAs ──────────────────────────
+async function neoConnect(){
+  const uri  = v('neo4j-uri');
+  const user = v('neo4j-user');
+  const pass = v('neo4j-pass');
+  const db   = v('neo4j-db');
+  const btn  = document.getElementById('btn-connect');
+  btn.textContent = '…'; btn.disabled = true;
+
+  if(globalDriver){
+    try{ await globalDriver.close(); }catch(_){}
+    globalDriver = null;
+  }
+
+  try{
+    globalDriver = neo4j.driver(uri, neo4j.auth.basic(user, pass));
+    await globalDriver.verifyConnectivity();
+  }catch(e){
+    setBadge('err','Neo4j: '+e.message.split('\n')[0]);
+    setBar('Connection failed: '+e.message);
+    globalDriver = null;
+    btn.textContent='⚡ CONNECT'; btn.disabled=false;
+    return;
+  }
+
+  try{
+    const ses = globalDriver.session({database:db});
+    const res = await ses.run(
+      'MATCH (p:PDA) RETURN p.id AS id, p.name AS name, p.desc AS desc ORDER BY p.name'
+    );
+    await ses.close();
+    savedPDAs = res.records.map(r=>({id:r.get('id'),name:r.get('name'),desc:r.get('desc')||''}));
+
+    const dd = document.getElementById('pda-dropdown');
+    dd.innerHTML='<option value="">-- select saved PDA --</option>';
+    savedPDAs.forEach(p=>{
+      const opt=document.createElement('option');
+      opt.value=p.id; opt.textContent=p.name+' ['+p.id+']';
+      dd.appendChild(opt);
+    });
+
+    document.getElementById('pda-select-sec').classList.add('visible');
+    document.getElementById('btn-load-pda').disabled=true;
+    document.getElementById('btn-delete-pda').disabled=true;
+
+    setBadge('ok','Neo4j connected — '+savedPDAs.length+' PDA(s)');
+    setBar('Connected. Found '+savedPDAs.length+' saved PDA(s).');
+
+    // Auto-collapse
+    const tog=document.getElementById('conn-panel-toggle');
+    const fld=document.getElementById('conn-fields');
+    if(tog.classList.contains('open')){ tog.classList.remove('open'); fld.classList.remove('open'); }
+
+  }catch(e){
+    setBadge('err','Query error');
+    setBar('Error fetching PDAs: '+e.message);
+  }
+  btn.textContent='⚡ CONNECT'; btn.disabled=false;
+}
+
+// ── Dropdown change ─────────────────────────────────────
+function onPdaDropdownChange(){
+  const id=v('pda-dropdown');
+  const info=document.getElementById('pda-db-info');
+  const btnL=document.getElementById('btn-load-pda');
+  const btnD=document.getElementById('btn-delete-pda');
+  if(!id){ btnL.disabled=true; btnD.disabled=true; info.classList.remove('visible'); return; }
+  const found=savedPDAs.find(p=>p.id===id);
+  if(found){ info.innerHTML='<span>'+escH(found.name)+'</span><br><div style="margin-top:3px;font-size:10px">'+escH(found.desc||'No description')+'</div>'; info.classList.add('visible'); }
+  btnL.disabled=false; btnD.disabled=false;
+}
+
+// ── Save current PDA to Neo4j ───────────────────────────
+async function savePDAtoNeo4j(){
+  if(!pda||!G){ toast('Build a grammar first','err'); return; }
+  if(!globalDriver){ toast('Connect to Neo4j first','err'); return; }
+
+  const name  = (G.name || (PRESETS.find(p=>p.id===activePreset)?.name) || 'Custom PDA').trim();
+  const id    = 'pda_'+(name.replace(/[^a-zA-Z0-9]/g,'_').toLowerCase())+'_'+Date.now();
+  const desc  = 'CFG: '+G.S+' → … | Σ={'+G.T.join(',')+'}';
+  const db    = v('neo4j-db');
+  const btn   = document.getElementById('btn-save-neo4j');
+  btn.textContent='…'; btn.disabled=true;
+
+  try{
+    const ses = globalDriver.session({database:db});
+
+    // Create PDA root node
+    await ses.run(
+      'CREATE (:PDA {id:$id, name:$name, desc:$desc, startState:$start, acceptStates:$acc, stackBottom:$z0, inputAlpha:$ia, stackAlpha:$sa})',
+      { id, name, desc, start:pda.start, acc:pda.accept.join(','), z0:pda.Z0,
+        ia:pda.inputAlpha.join(','), sa:pda.stackAlpha.join(',') }
+    );
+
+    // Create state nodes
+    for(const s of pda.states){
+      const isAcc = pda.accept.includes(s);
+      const isStart = s === pda.start;
+      await ses.run(
+        'CREATE (:PDAState {name:$name, pdaId:$pid, isStart:$is, isAccept:$ia})',
+        { name:id+'_'+s, pid:id, is:isStart, ia:isAcc }
+      );
+      await ses.run(
+        'MATCH (p:PDA {id:$pid}), (s:PDAState {name:$sn}) CREATE (p)-[:HAS_STATE]->(s)',
+        { pid:id, sn:id+'_'+s }
+      );
+    }
+
+    // Create transition relationships
+    for(const t of pda.trans){
+      await ses.run(
+        `MATCH (f:PDAState {name:$fn}), (to:PDAState {name:$tn})
+         CREATE (f)-[:PDA_TRANSITION {inp:$inp, pop:$pop, push:$push, type:$tp, rule:$rule}]->(to)`,
+        { fn:id+'_'+t.from, tn:id+'_'+t.to,
+          inp:t.inp, pop:t.pop, push:t.push, tp:t.type, rule:t.rule||'' }
+      );
+    }
+
+    // Store CFG productions as JSON on PDA node
+    await ses.run(
+      'MATCH (p:PDA {id:$id}) SET p.cfgVariables=$vars, p.cfgTerminals=$terms, p.cfgStart=$s, p.cfgProductions=$prods',
+      { id, vars:G.V.join(','), terms:G.T.join(','), s:G.S, prods:JSON.stringify(G.P) }
+    );
+
+    await ses.close();
+    savedPDAs.push({id,name,desc});
+
+    // Refresh dropdown
+    const dd=document.getElementById('pda-dropdown');
+    const opt=document.createElement('option');
+    opt.value=id; opt.textContent=name+' ['+id+']';
+    dd.appendChild(opt);
+
+    toast('Saved to Neo4j: '+name,'ok');
+    setBar('PDA "'+name+'" saved to Neo4j. ID: '+id);
+
+  }catch(e){
+    toast('Neo4j save error: '+e.message.split('\n')[0],'err');
+    setBar('Save error: '+e.message);
+  }
+  btn.textContent='☁ Save'; btn.disabled=false;
+}
+
+// ── Load selected PDA from Neo4j ────────────────────────
+async function loadSavedPDA(){
+  const id=v('pda-dropdown');
+  if(!id||!globalDriver){ toast('Select a PDA and connect first','err'); return; }
+  const db=v('neo4j-db');
+  const btn=document.getElementById('btn-load-pda');
+  btn.textContent='…'; btn.disabled=true;
+
+  try{
+    const ses = globalDriver.session({database:db});
+    const pr = await ses.run('MATCH (p:PDA {id:$id}) RETURN p', {id});
+    if(!pr.records.length){ toast('PDA not found in database','err'); btn.textContent='▶ LOAD'; btn.disabled=false; return; }
+
+    const props = pr.records[0].get('p').properties;
+
+    // Restore grammar
+    G = {
+      name:    props.name,
+      V:       (props.cfgVariables||'').split(',').filter(Boolean),
+      T:       (props.cfgTerminals||'').split(',').filter(Boolean),
+      S:       props.cfgStart||'',
+      P:       props.cfgProductions ? JSON.parse(props.cfgProductions) : {}
+    };
+
+    // Restore PDA transitions
+    const tr = await ses.run(
+      `MATCH (p:PDA {id:$id})-[:HAS_STATE]->(s:PDAState)-[t:PDA_TRANSITION]->(s2:PDAState)
+       RETURN s.name AS fn, t.inp AS inp, t.pop AS pop, t.push AS push,
+              t.type AS tp, t.rule AS rule, s2.name AS tn`,
+      {id}
+    );
+
+    const transArr = tr.records.map(r=>({
+      from:  r.get('fn').replace(id+'_',''),
+      to:    r.get('tn').replace(id+'_',''),
+      inp:   r.get('inp'), pop:r.get('pop'), push:r.get('push'),
+      type:  r.get('tp'),  rule:r.get('rule')
+    }));
+
+    pda = {
+      states:     (props.cfgVariables?[props.startState,...(props.acceptStates||'').split(',')]:['q0','q1','q_acc']),
+      start:      props.startState,
+      accept:     (props.acceptStates||'').split(','),
+      Z0:         props.stackBottom||'Z₀',
+      stackAlpha: (props.stackAlpha||'').split(','),
+      inputAlpha: (props.inputAlpha||'').split(','),
+      trans:      transArr,
+      layout:     'line'
+    };
+    // Fix states from actual transitions
+    const allStates=[...new Set(transArr.flatMap(t=>[t.from,t.to]))];
+    pda.states = allStates;
+
+    await ses.close();
+
+    activePreset = null;
+    updateSidebarGrammar();
+    layoutPDA();
+    drawPDA(null,null);
+    showSidebarSections();
+    resetSim();
+    document.getElementById('canvas-hint').style.display='none';
+    setBadge('ok','Loaded: '+props.name);
+    setBar('PDA "'+props.name+'" loaded from Neo4j.');
+    toast('Loaded: '+props.name,'ok');
+
+  }catch(e){
+    toast('Load error: '+e.message.split('\n')[0],'err');
+    setBar('Load error: '+e.message);
+  }
+  btn.textContent='▶ LOAD'; btn.disabled=false;
+}
+
+// ── Delete PDA from Neo4j ───────────────────────────────
+async function deleteSavedPDA(){
+  const id=v('pda-dropdown');
+  if(!id||!globalDriver){ toast('Select a PDA first','err'); return; }
+  if(!confirm('Delete this PDA from Neo4j? This cannot be undone.')) return;
+  const db=v('neo4j-db');
+
+  try{
+    const ses=globalDriver.session({database:db});
+    await ses.run(
+      'MATCH (p:PDA {id:$id})-[:HAS_STATE]->(s:PDAState) DETACH DELETE s',{id}
+    );
+    await ses.run('MATCH (p:PDA {id:$id}) DETACH DELETE p',{id});
+    await ses.close();
+
+    savedPDAs = savedPDAs.filter(p=>p.id!==id);
+    const dd=document.getElementById('pda-dropdown');
+    const opt=[...dd.options].find(o=>o.value===id);
+    if(opt) dd.removeChild(opt);
+    dd.value=''; onPdaDropdownChange();
+    document.getElementById('pda-db-info').classList.remove('visible');
+    toast('PDA deleted from Neo4j','ok');
+    setBar('PDA deleted.');
+  }catch(e){
+    toast('Delete error: '+e.message.split('\n')[0],'err');
+  }
+}
+
+// ════════════════════════════════════════════════════════
+//  IMPORT / EXPORT
+// ════════════════════════════════════════════════════════
+
+// Export CFG as .cfg JSON file
+function exportCFG(){
+  if(!G){ toast('No grammar to export','err'); return; }
+  const obj={
+    name:       G.name||'grammar',
+    variables:  G.V,
+    terminals:  G.T,
+    startSymbol:G.S,
+    productions:G.P,
+    version:    '1.0',
+    createdAt:  new Date().toISOString().split('T')[0]
+  };
+  _downloadJSON(obj, (G.name||'grammar').replace(/[^a-z0-9_-]/gi,'_').toLowerCase()+'.cfg');
+  toast('CFG exported','ok');
+}
+
+function _downloadJSON(obj, fname){
+  const blob=new Blob([JSON.stringify(obj,null,2)],{type:'application/json'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob); a.download=fname; a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// Import .cfg file — restores grammar + rebuilds PDA
+function importCFGFile(e){
+  const file=e.target.files[0]; if(!file) return;
+  const reader=new FileReader();
+  reader.onload=ev=>{
+    try{
+      const obj=JSON.parse(ev.target.result);
+      G={ name:obj.name||'', V:obj.variables||[], T:obj.terminals||[],
+          S:obj.startSymbol||'', P:obj.productions||{} };
+      activePreset=null;
+      buildPDA();
+      updateSidebarGrammar();
+      layoutPDA();
+      drawPDA(null,null);
+      showSidebarSections();
+      resetSim();
+      document.getElementById('canvas-hint').style.display='none';
+      setBadge('ok','Imported: '+(G.name||file.name));
+      setBar('CFG imported from "'+file.name+'"');
+      toast('CFG imported: '+G.name,'ok');
+    }catch(err){
+      toast('Invalid .cfg file: '+err.message,'err');
+    }
+  };
+  reader.readAsText(file);
+  e.target.value='';
+}
+
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+:root{
+  --bg:#0f172a; --surface:#1e293b; --card:#334155; --border:#475569;
+  --accent:#818cf8; --accent-hover:#6366f1;
+  --green:#10b981; --red:#ef4444; --yellow:#f59e0b; --purple:#a78bfa; --cyan:#22d3ee;
+  --text:#f8fafc; --muted:#94a3b8;
+  --font-ui:'Inter',sans-serif; --font-mono:'JetBrains Mono',monospace;
+}
+:root.light{
+  --bg:#f1f5f9; --surface:#ffffff; --card:#e2e8f0; --border:#cbd5e1;
+  --accent:#4f46e5; --accent-hover:#4338ca;
+  --green:#059669; --red:#dc2626; --yellow:#d97706; --purple:#7c3aed; --cyan:#0891b2;
+  --text:#0f172a; --muted:#64748b;
+}
+/* theme-aware SVG canvas bg */
+:root.light #svg-canvas{background:#f8fafc;}
+:root.light .canvas-area{background:#f8fafc;}
+body{background:var(--bg);color:var(--text);font-family:var(--font-ui);height:100vh;display:flex;flex-direction:column;overflow:hidden;}
+
+/* ── Header ── */
+header{display:flex;align-items:center;gap:12px;padding:14px 24px;
+  border-bottom:1px solid var(--border);background:var(--surface);
+  flex-shrink:0;box-shadow:0 4px 12px rgba(0,0,0,.1);z-index:20;}
+header h1{font-family:var(--font-mono);font-size:16px;font-weight:700;letter-spacing:2px;color:var(--accent);}
+header .sep{color:var(--border);}
+header .sub{font-size:13px;color:var(--muted);font-weight:500;}
+.hdr-badge{margin-left:auto;font-size:12px;display:flex;align-items:center;gap:8px;
+  font-weight:600;background:var(--bg);padding:6px 12px;border-radius:20px;border:1px solid var(--border);}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;}
+.dot-green{background:var(--green);box-shadow:0 0 8px var(--green);}
+.dot-yellow{background:var(--yellow);animation:blink 1s infinite;}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* ── Layout ── */
+.main{display:flex;flex:1;overflow:hidden;}
+
+/* ── Sidebar ── */
+.sidebar{width:300px;border-right:1px solid var(--border);background:var(--surface);
+  display:flex;flex-direction:column;overflow-y:auto;flex-shrink:0;z-index:10;
+  box-shadow:4px 0 15px rgba(0,0,0,.1);}
+.sidebar::-webkit-scrollbar{width:6px;}
+.sidebar::-webkit-scrollbar-thumb{background:var(--border);border-radius:6px;}
+.sec{padding:16px 18px;border-bottom:1px solid var(--border);}
+.sec-title{font-size:10px;letter-spacing:2px;color:var(--muted);font-weight:700;
+  text-transform:uppercase;margin-bottom:12px;}
+label{display:block;font-size:12px;font-weight:500;color:var(--text);margin-bottom:5px;}
+input[type=text],select{width:100%;background:var(--bg);border:1px solid var(--border);
+  color:var(--text);font-family:var(--font-mono);font-size:12px;padding:9px 11px;
+  border-radius:6px;margin-bottom:10px;outline:none;transition:all .2s;appearance:none;}
+input[type=text]:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(129,140,248,.2);}
+select option{background:var(--card);}
+
+/* ── Buttons ── */
+button{font-family:var(--font-ui);font-size:12px;font-weight:600;letter-spacing:.5px;
+  padding:9px 14px;border:none;border-radius:6px;cursor:pointer;transition:all .2s;}
+.btn-primary{width:100%;background:var(--accent);color:var(--bg);margin-bottom:8px;}
+.btn-primary:hover{background:var(--accent-hover);transform:translateY(-1px);}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed;transform:none;}
+.btn-row{display:flex;gap:8px;}
+.btn-ghost{flex:1;background:transparent;border:1px solid var(--border);color:var(--text);}
+.btn-ghost:hover{border-color:var(--accent);color:var(--accent);background:rgba(129,140,248,.1);}
+.btn-ghost:disabled{opacity:.4;cursor:not-allowed;}
+.btn-run{flex:1;background:var(--green);color:var(--bg);}
+.btn-run:hover{background:#059669;transform:translateY(-1px);}
+.btn-run:disabled{opacity:.5;cursor:not-allowed;transform:none;}
+.btn-danger{background:transparent;border:1px solid var(--border);color:var(--muted);width:100%;margin-bottom:6px;}
+.btn-danger:hover{border-color:var(--red);color:var(--red);background:rgba(239,68,68,.08);}
+
+/* ── Grammar info card ── */
+.grammar-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  padding:12px 14px;margin-bottom:10px;font-size:11px;color:var(--muted);min-height:40px;line-height:1.6;}
+.grammar-card span{color:var(--accent);font-weight:600;font-size:12px;}
+.grammar-notation{font-family:var(--font-mono);font-size:12px;line-height:2;margin-bottom:10px;}
+.gn-var{color:var(--accent);font-weight:700;}
+.gn-term{color:var(--purple);font-weight:600;}
+.gn-eps{color:var(--cyan);}
+.gn-arrow{color:var(--muted);}
+.gn-pipe{color:var(--border);}
+
+/* ── Input tape chars ── */
+.char-row{display:flex;flex-wrap:wrap;gap:5px;min-height:40px;
+  background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  padding:7px;margin-top:8px;}
+.ch{width:28px;height:28px;display:flex;align-items:center;justify-content:center;
+  border-radius:4px;font-size:14px;font-weight:700;font-family:var(--font-mono);
+  background:var(--card);border:1px solid var(--border);transition:all .2s cubic-bezier(.4,0,.2,1);}
+.ch.active{background:rgba(245,158,11,.2);border-color:var(--yellow);color:var(--yellow);
+  transform:scale(1.15) translateY(-2px);box-shadow:0 4px 10px rgba(245,158,11,.3);}
+.ch.done{background:rgba(16,185,129,.1);border-color:var(--green);color:var(--green);opacity:.7;}
+
+/* ── Trace ── */
+.trace-scroll{max-height:160px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;
+  background:var(--bg);padding:10px;border-radius:6px;border:1px solid var(--border);}
+.trace-scroll::-webkit-scrollbar{width:4px;}
+.trace-scroll::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px;}
+.trace-line{font-size:11px;font-family:var(--font-mono);display:flex;align-items:center;gap:6px;color:var(--muted);}
+.tl-sym{color:var(--yellow);font-weight:700;background:rgba(245,158,11,.1);padding:1px 5px;border-radius:3px;}
+.tl-state{color:var(--accent);font-weight:600;}
+.tl-action{color:var(--purple);}
+.tl-rule{color:var(--muted);font-style:italic;}
+.tl-accept{color:var(--green);font-weight:700;}
+.tl-reject{color:var(--red);font-weight:700;}
+
+.result-box{margin-top:10px;padding:10px 14px;border-radius:6px;
+  font-size:13px;font-weight:700;letter-spacing:1px;text-align:center;}
+.res-accept{background:rgba(16,185,129,.1);border:1px solid var(--green);color:var(--green);}
+.res-reject{background:rgba(239,68,68,.1);border:1px solid var(--red);color:var(--red);}
+
+/* ── PDA state pills ── */
+.state-pills{display:flex;flex-direction:column;gap:6px;}
+.state-pill{display:flex;align-items:center;gap:10px;
+  background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 11px;}
+.sp-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;}
+.sp-name{font-family:var(--font-mono);font-size:12px;font-weight:700;color:var(--text);}
+.sp-role{font-size:10px;color:var(--muted);margin-left:auto;}
+.sp-active{border-color:var(--yellow)!important;background:rgba(245,158,11,.06)!important;}
+.sp-active .sp-name{color:var(--yellow)!important;}
+
+/* ── Stack display ── */
+.stack-display{display:flex;flex-direction:column;gap:3px;min-height:60px;max-height:200px;overflow-y:auto;}
+.stack-display::-webkit-scrollbar{width:3px;}
+.stack-display::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px;}
+.sk-cell{display:flex;align-items:center;justify-content:space-between;
+  background:var(--bg);border:1px solid var(--border);border-radius:4px;
+  padding:5px 10px;font-family:var(--font-mono);font-size:13px;font-weight:700;
+  color:var(--muted);transition:all .2s;}
+.sk-cell.sk-top{border-color:var(--purple);color:var(--purple);background:rgba(167,139,250,.08);}
+.sk-cell.sk-var{color:var(--accent);border-color:rgba(129,140,248,.35);}
+.sk-cell.sk-term{color:var(--cyan);border-color:rgba(34,211,238,.3);}
+.sk-cell.sk-bot{color:var(--yellow);border-color:rgba(245,158,11,.3);font-size:11px;}
+.sk-tag{font-size:9px;color:var(--muted);font-family:var(--font-ui);letter-spacing:.5px;}
+
+
+/* ── Neo4j Connection Panel ── */
+.conn-panel-toggle{width:100%;background:transparent;border:none;cursor:pointer;
+  display:flex;align-items:center;justify-content:space-between;padding:0;margin-bottom:0;}
+.conn-panel-toggle:hover .sec-title{color:var(--accent);}
+.conn-fields{display:none;margin-top:12px;}
+.conn-fields.open{display:block;}
+.caret{color:var(--muted);font-size:11px;transition:transform .2s;}
+.conn-panel-toggle.open .caret{transform:rotate(180deg);}
+input[type="password"]{width:100%;background:var(--bg);border:1px solid var(--border);
+  color:var(--text);font-family:var(--font-mono);font-size:12px;padding:9px 11px;
+  border-radius:6px;margin-bottom:10px;outline:none;transition:all .2s;}
+input[type="password"]:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(129,140,248,.2);}
+.pda-select-sec{display:none;}
+.pda-select-sec.visible{display:block;}
+.pda-info{font-size:11px;color:var(--muted);padding:7px 10px;background:var(--bg);
+  border:1px solid var(--border);border-radius:5px;margin-bottom:8px;min-height:32px;display:none;}
+.pda-info.visible{display:block;}
+.pda-info span{color:var(--accent);font-weight:600;}
+/* ── Import/export row ── */
+.io-row{display:flex;gap:6px;margin-top:6px;}
+.io-btn{flex:1;font-size:11px;padding:7px 8px;background:transparent;border:1px solid var(--border);
+  color:var(--text);border-radius:5px;cursor:pointer;font-family:var(--font-ui);font-weight:600;
+  transition:all .15s;letter-spacing:.3px;}
+.io-btn:hover{border-color:var(--accent);color:var(--accent);background:rgba(129,140,248,.07);}
+/* ── Dot colours ── */
+.dot-red{background:var(--red);}
+
+/* ── Canvas area ── */
+.canvas-area{flex:1;display:flex;flex-direction:column;overflow:hidden;position:relative;
+  background-color:var(--bg);
+  background-image:radial-gradient(var(--border) 1px,transparent 0);
+  background-size:24px 24px;}
+.canvas-bar{padding:9px 20px;border-bottom:1px solid var(--border);
+  background:var(--surface);backdrop-filter:blur(8px);font-size:12px;color:var(--text);flex-shrink:0;
+  display:flex;align-items:center;gap:10px;position:absolute;top:0;left:0;right:0;z-index:5;}
+.canvas-tag{background:var(--accent);border:1px solid var(--accent-hover);color:var(--bg);
+  border-radius:4px;padding:3px 8px;font-size:10px;font-weight:700;letter-spacing:1px;}
+.canvas-bar .bar-info{font-size:11px;color:var(--muted);}
+.canvas-hint{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+  text-align:center;pointer-events:none;z-index:1;}
+.canvas-hint h2{font-family:var(--font-mono);font-size:16px;font-weight:700;letter-spacing:3px;
+  color:var(--border);margin-bottom:8px;}
+.canvas-hint p{font-size:12px;color:var(--muted);}
+#svg-canvas{flex:1;width:100%;height:100%;cursor:grab;display:block;
+  background:transparent;pointer-events:all;}
+.floating-controls{position:absolute;bottom:24px;right:24px;display:flex;flex-direction:column;
+  gap:8px;z-index:10;background:var(--surface);padding:8px;border-radius:8px;
+  border:1px solid var(--border);box-shadow:0 4px 15px rgba(0,0,0,.2);}
+.floating-controls button{width:36px;height:36px;background:var(--card);border:1px solid var(--border);
+  color:var(--text);font-size:16px;border-radius:6px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;transition:all .2s;font-weight:700;}
+.floating-controls button:hover{background:var(--accent);color:var(--bg);border-color:var(--accent);}
+.floating-controls button.fit-btn{font-size:10px;font-family:var(--font-ui);}
+
+/* ── Stack on canvas (floating) ── */
+.canvas-stack{position:absolute;top:52px;right:16px;z-index:8;
+  background:var(--surface);backdrop-filter:blur(8px);
+  border:1px solid var(--border);border-radius:8px;padding:10px;
+  width:120px;display:none;}
+.canvas-stack.visible{display:block;}
+.cs-title{font-family:var(--font-mono);font-size:9px;font-weight:700;letter-spacing:2px;
+  text-transform:uppercase;color:var(--muted);margin-bottom:8px;text-align:center;}
+.cs-cells{display:flex;flex-direction:column;gap:3px;max-height:240px;overflow-y:auto;}
+.cs-cell{height:32px;border-radius:4px;border:1px solid var(--border);background:var(--bg);
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--font-mono);font-size:13px;font-weight:700;color:var(--muted);
+  position:relative;transition:all .2s;}
+.cs-cell.cs-top{border-color:var(--purple);color:var(--purple);background:rgba(167,139,250,.1);
+  box-shadow:0 0 8px rgba(167,139,250,.2);}
+.cs-cell.cs-var{color:var(--accent);border-color:rgba(129,140,248,.35);}
+.cs-cell.cs-term{color:var(--cyan);border-color:rgba(34,211,238,.3);}
+.cs-cell.cs-bot{color:var(--yellow);border-color:rgba(245,158,11,.3);font-size:10px;}
+.cs-lbl{position:absolute;right:4px;top:1px;font-size:7px;color:var(--muted);
+  font-family:var(--font-mono);letter-spacing:.3px;}
+.cs-top-lbl{text-align:center;font-family:var(--font-mono);font-size:8px;
+  color:var(--muted);margin-top:6px;letter-spacing:1px;}
+
+/* ── Tape on canvas ── */
+.canvas-tape{position:absolute;bottom:80px;left:50%;transform:translateX(-50%);z-index:8;
+  background:var(--surface);backdrop-filter:blur(8px);
+  border:1px solid var(--border);border-radius:8px;padding:8px 12px;
+  display:none;}
+.canvas-tape.visible{display:flex;align-items:center;gap:8px;}
+.ct-label{font-family:var(--font-mono);font-size:9px;font-weight:700;letter-spacing:2px;
+  text-transform:uppercase;color:var(--muted);margin-right:4px;white-space:nowrap;}
+.ct-cells{display:flex;gap:3px;}
+.ct-cell{width:28px;height:30px;border-radius:4px;border:1px solid var(--border);background:var(--bg);
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--font-mono);font-size:13px;font-weight:700;color:var(--muted);
+  position:relative;transition:all .2s;}
+.ct-cell.ct-done{opacity:.28;}
+.ct-cell.ct-head{border-color:var(--yellow);color:var(--yellow);background:rgba(245,158,11,.15);
+  transform:translateY(-2px);box-shadow:0 4px 8px rgba(245,158,11,.3);}
+.ct-cell.ct-rem{color:var(--text);}
+.ct-idx{position:absolute;bottom:0px;right:2px;font-size:7px;color:var(--muted);}
+
+/* ── Modal ── */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(15,23,42,.75);
+  backdrop-filter:blur(4px);z-index:1000;align-items:center;justify-content:center;}
+.modal-overlay.open{display:flex;}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:12px;
+  width:860px;max-width:95vw;max-height:92vh;
+  display:flex;flex-direction:column;box-shadow:0 20px 50px rgba(0,0,0,.5);overflow:hidden;}
+.modal-header{display:flex;align-items:center;justify-content:space-between;
+  padding:18px 24px;background:var(--card);border-bottom:1px solid var(--border);flex-shrink:0;}
+.modal-header h2{font-size:14px;font-weight:700;letter-spacing:1.5px;color:var(--text);}
+.modal-close{background:transparent;border:none;color:var(--muted);font-size:24px;cursor:pointer;line-height:1;padding:0 4px;}
+.modal-close:hover{color:var(--red);transform:scale(1.1);}
+.modal-body{overflow-y:auto;padding:24px;display:flex;flex-direction:column;gap:22px;flex:1;}
+.modal-body::-webkit-scrollbar{width:6px;}
+.modal-body::-webkit-scrollbar-thumb{background:var(--border);border-radius:6px;}
+.modal-footer{padding:16px 24px;border-top:1px solid var(--border);background:var(--card);
+  display:flex;gap:12px;justify-content:flex-end;align-items:center;flex-shrink:0;}
+.modal-sec-title{font-size:11px;letter-spacing:2px;font-weight:700;color:var(--accent);
+  text-transform:uppercase;border-bottom:2px solid var(--card);padding-bottom:8px;margin-bottom:4px;}
+.form-row{display:flex;gap:16px;}
+.form-group{display:flex;flex-direction:column;gap:6px;flex:1;}
+.form-group textarea{resize:vertical;min-height:60px;background:var(--bg);border:1px solid var(--border);
+  color:var(--text);font-family:var(--font-mono);font-size:12px;padding:9px 11px;
+  border-radius:6px;outline:none;transition:all .2s;width:100%;}
+.form-group textarea:focus{border-color:var(--accent);}
+
+/* Preset cards in modal */
+.preset-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin-top:10px;}
+.preset-item{padding:10px 12px;border-radius:6px;border:1px solid var(--border);
+  border-left:3px solid transparent;background:var(--card);cursor:pointer;transition:all .15s;}
+.preset-item:hover{border-color:var(--accent);border-left-color:var(--accent);background:rgba(129,140,248,.06);}
+.preset-item.selected{border-color:var(--accent);border-left-color:var(--accent);background:rgba(129,140,248,.12);}
+.pi-name{font-family:var(--font-mono);font-size:12px;font-weight:700;color:var(--text);}
+.pi-lang{font-size:10px;color:var(--accent);margin-top:2px;font-family:var(--font-mono);}
+
+/* Symbol pills */
+.alpha-pills{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px;}
+.alpha-pill{display:flex;align-items:center;gap:8px;background:var(--card);
+  border:1px solid var(--border);border-radius:20px;padding:4px 12px;
+  font-size:13px;font-weight:600;color:var(--text);font-family:var(--font-mono);}
+.alpha-pill.var-p{border-color:rgba(129,140,248,.5);color:var(--accent);}
+.alpha-pill.term-p{border-color:rgba(167,139,250,.5);color:var(--purple);}
+.alpha-pill button{background:none;border:none;cursor:pointer;color:var(--muted);font-size:16px;line-height:1;padding:0;}
+.alpha-pill button:hover{color:var(--red);}
+.start-badge{font-size:8px;background:var(--accent);color:var(--bg);border-radius:2px;padding:1px 4px;font-weight:700;letter-spacing:.5px;margin-left:4px;}
+
+/* Productions in modal */
+.prod-rows{display:flex;flex-direction:column;gap:6px;}
+.prod-row-m{display:flex;align-items:stretch;background:var(--bg);border:1px solid var(--border);border-radius:6px;overflow:hidden;transition:border-color .15s;}
+.prod-row-m:focus-within{border-color:var(--accent);}
+.prm-lhs{padding:8px 11px;font-family:var(--font-mono);font-size:13px;font-weight:700;color:var(--accent);
+  background:rgba(129,140,248,.08);border-right:1px solid var(--border);min-width:42px;text-align:center;flex-shrink:0;display:flex;align-items:center;justify-content:center;}
+.prm-arrow{padding:0 8px;color:var(--muted);font-family:var(--font-mono);font-size:14px;flex-shrink:0;display:flex;align-items:center;}
+.prm-rhs{flex:1;display:flex;flex-wrap:wrap;gap:5px;padding:6px 8px;min-height:36px;align-items:center;}
+.rhs-tag{display:flex;align-items:center;gap:4px;background:var(--surface);border:1px solid var(--border);
+  border-radius:4px;padding:3px 8px 3px 10px;font-family:var(--font-mono);font-size:12px;color:var(--text);}
+.rhs-tag button{background:none;border:none;cursor:pointer;color:var(--muted);font-size:12px;line-height:1;padding:0;}
+.rhs-tag button:hover{color:var(--red);}
+.rhs-add-btn{background:none;border:none;cursor:pointer;color:var(--muted);font-size:20px;
+  line-height:1;padding:0 6px;transition:color .15s;display:flex;align-items:center;}
+.rhs-add-btn:hover{color:var(--green);}
+.prm-del{background:none;border:none;border-left:1px solid var(--border);padding:0 10px;
+  cursor:pointer;color:var(--muted);font-size:12px;transition:all .15s;flex-shrink:0;display:flex;align-items:center;}
+.prm-del:hover{color:var(--red);background:rgba(239,68,68,.07);}
+.add-prod-form{display:flex;gap:6px;align-items:center;background:var(--bg);border:1px dashed var(--border);
+  border-radius:6px;padding:8px 10px;margin-top:5px;}
+.add-prod-form:focus-within{border-color:var(--accent);border-style:solid;}
+.add-prod-form select{flex:0 0 64px;margin-bottom:0;appearance:none;cursor:pointer;text-align:center;padding:7px 8px;}
+.add-prod-form input{flex:1;margin-bottom:0;}
+
+/* modal messages */
+.modal-msg{font-size:12px;font-weight:600;padding:6px 14px;border-radius:4px;
+  border:1px solid;flex:1;display:none;}
+.modal-msg.ok{color:var(--green);border-color:var(--green);background:rgba(16,185,129,.08);display:block;}
+.modal-msg.err{color:var(--red);border-color:var(--red);background:rgba(239,68,68,.08);display:block;}
+.btn-modal-cancel{background:transparent;border:1px solid var(--border);color:var(--text);}
+.btn-modal-cancel:hover{border-color:var(--accent);color:var(--accent);}
+.btn-modal-save{background:var(--accent);color:var(--bg);}
+.btn-modal-save:hover{background:var(--accent-hover);transform:translateY(-1px);}
+
+/* quick set buttons */
+.qset{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;}
+.qs-btn{font-size:11px;padding:5px 11px;background:transparent;border:1px solid var(--border);
+  color:var(--text);border-radius:5px;cursor:pointer;font-family:var(--font-ui);transition:all .15s;}
+.qs-btn:hover{border-color:var(--accent);color:var(--accent);}
+
+/* Legend */
+.legend{display:flex;flex-direction:column;gap:8px;font-size:11px;color:var(--muted);}
+.li{display:flex;align-items:center;gap:8px;}
+.lc{width:18px;height:18px;border-radius:50%;border:2px solid var(--accent);background:var(--bg);flex-shrink:0;}
+.lc-accept{border-color:var(--green);box-shadow:0 0 0 3px var(--surface),0 0 0 5px var(--green);}
+.lc-current{border-color:var(--yellow);background:rgba(245,158,11,.15);box-shadow:0 0 10px rgba(245,158,11,.4);}
+
+::-webkit-scrollbar{width:6px;}::-webkit-scrollbar-track{background:transparent;}::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px;}
+</style>
+</head>
+<body>
+
+<!-- ══ HEADER ══ -->
+<header>
+  <h1>CFG / PDA</h1>
+  <span class="sep">|</span>
+  <span class="sub">Context-Free Grammar & Pushdown Automaton Simulator</span>
+  <div class="hdr-badge" id="hdr-badge">
+    <span class="dot dot-yellow" id="badge-dot"></span>
+    <span id="badge-txt">No grammar loaded</span>
+  </div>
+  <button id="theme-toggle" onclick="toggleTheme()" title="Toggle light/dark theme"
+    style="margin-left:10px;background:transparent;border:1px solid var(--border);color:var(--muted);
+    padding:6px 12px;border-radius:20px;font-size:12px;font-weight:600;cursor:pointer;
+    display:flex;align-items:center;gap:6px;transition:all .2s;font-family:var(--font-ui)">
+    <span id="theme-icon">☀</span><span id="theme-label">Light</span>
+  </button>
+</header>
+
+<div class="main">
+
+<!-- ══ LEFT SIDEBAR ══ -->
+<div class="sidebar">
+
+
+  <!-- ── Neo4j Connection ── -->
+  <div class="sec" id="neo4j-sec">
+    <button class="conn-panel-toggle open" id="conn-panel-toggle" onclick="toggleConnPanel()">
+      <div class="sec-title" style="margin-bottom:0">Neo4j Database</div>
+      <span class="caret">▼</span>
+    </button>
+    <div class="conn-fields open" id="conn-fields" style="margin-top:12px">
+      <label>URI</label>
+      <input type="text" id="neo4j-uri" value="neo4j://127.0.0.1:7687">
+      <label>Username</label>
+      <input type="text" id="neo4j-user" value="neo4j">
+      <label>Password</label>
+      <input type="password" id="neo4j-pass" placeholder="••••••••"
+             oninput="localStorage.setItem('pda_neo4j_pass',this.value)">
+      <input type="hidden" id="neo4j-db" value="neo4j">
+      <button class="btn-primary" id="btn-connect" onclick="neoConnect()">⚡ CONNECT</button>
+    </div>
+  </div>
+
+  <!-- ── Load saved PDA ── -->
+  <div class="sec pda-select-sec" id="pda-select-sec">
+    <div class="sec-title">Saved PDAs</div>
+    <select id="pda-dropdown" onchange="onPdaDropdownChange()">
+      <option value="">-- select saved PDA --</option>
+    </select>
+    <div class="pda-info" id="pda-db-info"></div>
+    <div style="display:flex;gap:6px">
+      <button class="btn-ghost" id="btn-load-pda" onclick="loadSavedPDA()" disabled style="flex:1">▶ LOAD</button>
+      <button id="btn-delete-pda" onclick="deleteSavedPDA()" disabled
+        title="Delete from database"
+        style="flex:0 0 36px;padding:0;display:flex;align-items:center;justify-content:center;
+               font-size:14px;background:transparent;border:1px solid var(--border);
+               color:var(--muted);border-radius:6px;cursor:pointer;transition:all .2s;"
+        onmouseover="if(!this.disabled){this.style.borderColor='var(--red)';this.style.color='var(--red)';this.style.background='rgba(239,68,68,0.1)'}"
+        onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--muted)';this.style.background='transparent'">
+        🗑
+      </button>
+    </div>
+  </div>
+
+  <!-- Grammar Actions -->
+  <div class="sec">
+    <div class="sec-title">Grammar</div>
+    <button class="btn-primary" onclick="openGrammarModal()">＋ CREATE / EDIT GRAMMAR</button>
+    <button class="btn-danger" onclick="clearGrammar()">✕ Clear Grammar</button>
+    <div class="io-row" id="io-row" style="display:none">
+      <button class="io-btn" onclick="exportCFG()" title="Export grammar as .cfg file">↓ CFG</button>
+      <button class="io-btn" onclick="document.getElementById('import-file').click()" title="Import .cfg file">↑ Import</button>
+      <button class="io-btn" id="btn-save-neo4j" onclick="savePDAtoNeo4j()" title="Save to Neo4j" style="border-color:var(--accent);color:var(--accent)">☁ Save</button>
+    </div>
+    <input type="file" id="import-file" accept=".cfg,.json" style="display:none" onchange="importCFGFile(event)">
+    <div class="grammar-card" id="grammar-card">
+      <em style="color:var(--muted)">No grammar loaded. Click above to create one.</em>
+    </div>
+  </div>
+
+  <!-- Grammar Notation -->
+  <div class="sec" id="notation-sec" style="display:none">
+    <div class="sec-title">Productions</div>
+    <div class="grammar-notation" id="grammar-notation"></div>
+  </div>
+
+  <!-- PDA States -->
+  <div class="sec" id="pda-sec" style="display:none">
+    <div class="sec-title">PDA States</div>
+    <div class="state-pills" id="state-pills">
+      <div class="state-pill">
+        <div class="sp-dot" style="background:var(--accent)"></div>
+        <div class="sp-name">q0</div>
+        <div class="sp-role">Start</div>
+      </div>
+      <div class="state-pill">
+        <div class="sp-dot" style="background:var(--cyan)"></div>
+        <div class="sp-name">q_loop</div>
+        <div class="sp-role">Loop</div>
+      </div>
+      <div class="state-pill">
+        <div class="sp-dot" style="background:var(--green)"></div>
+        <div class="sp-name">q_acc</div>
+        <div class="sp-role">Accept</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Simulation Input -->
+  <div class="sec" id="sim-sec" style="display:none">
+    <div class="sec-title">Simulation</div>
+    <label>Input String</label>
+    <input type="text" id="sim-input" placeholder="e.g.  aabb  or  ε for empty"
+           onkeydown="if(event.key==='Enter')startSim()">
+    <div id="char-row" class="char-row"></div>
+    <div class="btn-row" style="margin-top:10px">
+      <button class="btn-ghost" id="btn-step" onclick="stepSim()" disabled>STEP</button>
+      <button class="btn-run"   id="btn-run"  onclick="runAll()"  disabled>RUN</button>
+    </div>
+    <button class="btn-ghost" id="btn-reset" onclick="resetSim()" style="width:100%;margin-top:6px" disabled>↺ RESET</button>
+    <!-- Quick test buttons -->
+    <div id="quick-btns" style="display:flex;flex-wrap:wrap;gap:5px;margin-top:8px"></div>
+  </div>
+
+  <!-- Stack display -->
+  <div class="sec" id="stack-sec" style="display:none">
+    <div class="sec-title">Stack <span id="stack-depth-lbl" style="font-size:10px;color:var(--muted);font-weight:400;letter-spacing:.5px;text-transform:none"></span></div>
+    <div class="stack-display" id="stack-display">
+      <div style="font-size:11px;color:var(--muted);font-style:italic;text-align:center;padding:8px">Stack empty</div>
+    </div>
+  </div>
+
+  <!-- Trace -->
+  <div class="sec" id="trace-sec" style="display:none">
+    <div class="sec-title">Computation Trace</div>
+    <div class="trace-scroll" id="trace"></div>
+    <div id="result"></div>
+  </div>
+
+  <!-- Legend -->
+  <div class="sec">
+    <div class="sec-title">Legend</div>
+    <div class="legend">
+      <div class="li"><div class="lc"></div>Normal state</div>
+      <div class="li"><div class="lc lc-accept"></div>Accept state</div>
+      <div class="li"><div class="lc lc-current"></div>Current state</div>
+      <div class="li" style="margin-top:4px"><span style="font-family:var(--font-mono);font-size:11px;color:var(--yellow)">inp, pop → push</span><span style="margin-left:4px">Transition label</span></div>
+    </div>
+  </div>
+
+</div><!-- sidebar -->
+
+<!-- ══ CANVAS AREA ══ -->
+<div class="canvas-area">
+  <div class="canvas-bar" id="canvas-bar">
+    <span id="bar-text" style="color:var(--muted)">Create a grammar to begin</span>
+  </div>
+
+  <div class="canvas-hint" id="canvas-hint">
+    <h2>NO GRAMMAR</h2>
+    <p>Click "CREATE / EDIT GRAMMAR" to begin</p>
+  </div>
+
+  <svg id="svg-canvas" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <marker id="arr"          markerWidth="12" markerHeight="9" refX="10" refY="4.5" orient="auto" overflow="visible"><polygon points="0 0,11 4.5,0 9" fill="#818cf8"/></marker>
+      <marker id="arr-y"        markerWidth="12" markerHeight="9" refX="10" refY="4.5" orient="auto" overflow="visible"><polygon points="0 0,11 4.5,0 9" fill="#f59e0b"/></marker>
+      <marker id="arr-c"        markerWidth="12" markerHeight="9" refX="10" refY="4.5" orient="auto" overflow="visible"><polygon points="0 0,11 4.5,0 9" fill="#22d3ee"/></marker>
+      <marker id="arr-g"        markerWidth="12" markerHeight="9" refX="10" refY="4.5" orient="auto" overflow="visible"><polygon points="0 0,11 4.5,0 9" fill="#10b981"/></marker>
+      <marker id="arr-dark"     markerWidth="12" markerHeight="9" refX="10" refY="4.5" orient="auto" overflow="visible"><polygon points="0 0,11 4.5,0 9" fill="#4f46e5"/></marker>
+      <marker id="arr-cyan-dark" markerWidth="12" markerHeight="9" refX="10" refY="4.5" orient="auto" overflow="visible"><polygon points="0 0,11 4.5,0 9" fill="#0891b2"/></marker>
+      <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+        <feGaussianBlur stdDeviation="4" result="blur"/>
+        <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+      </filter>
+    </defs>
+    <g id="viewport"></g>
+  </svg>
+
+  <!-- Stack on canvas -->
+  <div class="canvas-stack" id="canvas-stack">
+    <div class="cs-title">Stack</div>
+    <div class="cs-cells" id="cs-cells"></div>
+    <div class="cs-top-lbl">▲ TOP</div>
+  </div>
+
+  <!-- Input tape on canvas -->
+  <div class="canvas-tape" id="canvas-tape">
+    <span class="ct-label">TAPE</span>
+    <div class="ct-cells" id="ct-cells"></div>
+  </div>
+
+  <div class="floating-controls">
+    <button onclick="zoomBy(1.2)" title="Zoom In">+</button>
+    <button onclick="zoomBy(0.83)" title="Zoom Out">−</button>
+    <button onclick="fitView()" class="fit-btn" title="Fit">FIT</button>
+  </div>
+</div><!-- canvas-area -->
+
+</div><!-- main -->
+
+<!-- ══ GRAMMAR MODAL ══ -->
+<div class="modal-overlay" id="grammar-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <h2>⚙ CFG BUILDER</h2>
+      <button class="modal-close" onclick="closeGrammarModal()">✕</button>
+    </div>
+    <div class="modal-body">
+
+      <!-- Presets -->
+      <div>
+        <div class="modal-sec-title">① Quick Presets</div>
+        <div class="preset-grid" id="preset-grid"></div>
+      </div>
+
+      <!-- Variables -->
+      <div>
+        <div class="modal-sec-title">② Variables (Non-terminals)</div>
+        <div class="alpha-pills" id="m-var-pills"></div>
+        <div style="display:flex;gap:8px;margin-top:10px;align-items:flex-end">
+          <div class="form-group" style="flex:0 0 140px">
+            <label>Add Variable</label>
+            <input type="text" id="m-var-inp" placeholder="e.g. S  A  B" maxlength="4"
+                   onkeydown="if(event.key==='Enter')mAddVar()" style="margin-bottom:0">
+          </div>
+          <button onclick="mAddVar()" style="height:36px;padding:0 18px;background:var(--accent);border:none;color:var(--bg);border-radius:6px;font-family:var(--font-ui);font-size:12px;font-weight:700;cursor:pointer;margin-bottom:1px">ADD</button>
+          <div class="form-group" style="flex:1">
+            <label>Start Symbol</label>
+            <select id="m-start" style="margin-bottom:0"><option value="">-- select --</option></select>
+          </div>
+        </div>
+      </div>
+
+      <!-- Terminals -->
+      <div>
+        <div class="modal-sec-title">③ Terminals (Alphabet Σ)</div>
+        <div class="alpha-pills" id="m-term-pills"></div>
+        <div class="qset" style="margin-top:10px">
+          <button class="qs-btn" onclick="mAddTermSet(['a','b'])">{ a, b }</button>
+          <button class="qs-btn" onclick="mAddTermSet(['0','1'])">{ 0, 1 }</button>
+          <button class="qs-btn" onclick="mAddTermSet(['(',')','{','}'])">brackets</button>
+        </div>
+        <div style="display:flex;gap:8px;align-items:flex-end">
+          <div class="form-group" style="flex:0 0 140px">
+            <label>Add Terminal</label>
+            <input type="text" id="m-term-inp" placeholder="e.g. a  or  id" maxlength="4"
+                   onkeydown="if(event.key==='Enter')mAddTerm()" style="margin-bottom:0">
+          </div>
+          <button onclick="mAddTerm()" style="height:36px;padding:0 18px;background:var(--accent);border:none;color:var(--bg);border-radius:6px;font-family:var(--font-ui);font-size:12px;font-weight:700;cursor:pointer;margin-bottom:1px">ADD</button>
+        </div>
+      </div>
+
+      <!-- Productions -->
+      <div>
+        <div class="modal-sec-title">④ Production Rules</div>
+        <div class="prod-rows" id="m-prod-rows"></div>
+        <div class="add-prod-form" id="m-add-prod-form" style="display:none">
+          <select id="m-lhs-sel"></select>
+          <span style="color:var(--muted);font-family:var(--font-mono);font-size:14px;font-weight:700">→</span>
+          <input type="text" id="m-rhs-inp" placeholder="e.g.  aSb   or   ab   or   e (for ε)"
+                 onkeydown="if(event.key==='Enter')mAddProd()">
+          <button onclick="mAddProd()" style="white-space:nowrap;padding:7px 14px;background:var(--accent);border:none;color:var(--bg);border-radius:5px;font-family:var(--font-ui);font-size:12px;font-weight:700;cursor:pointer">ADD RULE</button>
+        </div>
+        <div style="font-size:11px;color:var(--muted);margin-top:8px">
+          Tip: type <strong style="color:var(--text)">e</strong> for ε (empty string / epsilon)
+        </div>
+      </div>
+
+    </div>
+    <div class="modal-footer">
+      <span id="modal-msg" class="modal-msg"></span>
+      <button class="btn-modal-cancel" onclick="closeGrammarModal()">CANCEL</button>
+      <button class="btn-modal-save" onclick="applyGrammar()">✓ APPLY GRAMMAR</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ══════════════════════════════════════════════════════════
+//  PRESETS
+// ══════════════════════════════════════════════════════════
+const PRESETS = [
+  {id:'anbn',  name:'aⁿbⁿ  (n≥1)',     lang:'{ aⁿbⁿ | n≥1 }',       V:['S'],T:['a','b'],S:'S',P:{S:['aSb','ab']},       ex:['ab','aabb','aaabbb','ba','aab','a']},
+  {id:'anbn0', name:'aⁿbⁿ  (n≥0)',     lang:'{ aⁿbⁿ | n≥0 }',       V:['S'],T:['a','b'],S:'S',P:{S:['aSb','e']},        ex:['','ab','aabb','ba','a','b']},
+  {id:'eqab',  name:'Equal a\'s & b\'s', lang:'{ w | #a=#b }',        V:['S'],T:['a','b'],S:'S',P:{S:['aSbS','bSaS','e']},ex:['','ab','ba','abba','aabb','aab']},
+  {id:'palab', name:'Palindromes {a,b}', lang:'{ w | w=wᴿ }',         V:['S'],T:['a','b'],S:'S',P:{S:['aSa','bSb','a','b','e']},ex:['','a','aba','abba','aabaa','ab']},
+  {id:'wwR',   name:'wwᴿ',              lang:'{ wwᴿ | w∈{a,b}* }',   V:['S'],T:['a','b'],S:'S',P:{S:['aSa','bSb','e']},  ex:['','aa','abba','aabbaa','ab']},
+  {id:'balp',  name:'Balanced  ( )',    lang:'well-nested parens',     V:['S'],T:['(',')'],S:'S',P:{S:['SS','(S)','e']},  ex:['','()','(())','()()','(()())','((']},
+  {id:'morea', name:'More a\'s than b\'s', lang:'{ aⁿbᵐ | n>m≥0 }',  V:['S','A'],T:['a','b'],S:'S',P:{S:['AS','A'],A:['aAb','a']},ex:['a','aa','aab','aaab','ab','b']},
+  {id:'arith', name:'Arithmetic Expr',  lang:'E+T, T*F, (E), id',     V:['E','T','F'],T:['+','*','(',')', 'id'],S:'E',P:{E:['E+T','T'],T:['T*F','F'],F:['(E)','id']},ex:['id','id+id','id*id','id+id*id']},
+];
+
+// ══════════════════════════════════════════════════════════
+//  GRAMMAR & PDA STATE
+// ══════════════════════════════════════════════════════════
+const EPS = 'e';
+const EPS_SHOW = '\u03b5';
+
+// Working grammar (in modal)
+let mG = { V:[], T:[], S:'', P:{} };
+let activePreset = null;
+
+// Current applied grammar
+let G   = null;
+let pda = null;
+
+// Simulation
+let simSteps  = [];
+let simCur    = -1;
+let simInput  = [];
+let isPlaying = false;
+let playTimer = null;
+
+// SVG pan/zoom
+let vx=0, vy=0, vz=1;
+let dragging=false, dragStart={x:0,y:0}, dragV={x:0,y:0};
+let draggingNode=null;
+
+// PDA node positions (draggable)
+let nodePos = {};
+
+// ══════════════════════════════════════════════════════════
+//  INIT
+// ══════════════════════════════════════════════════════════
+window.addEventListener('DOMContentLoaded', () => {
+  renderPresetGrid();
+  initSVGPan();
+});
+
+// ══════════════════════════════════════════════════════════
+//  PRESET GRID
+// ══════════════════════════════════════════════════════════
+function renderPresetGrid() {
+  document.getElementById('preset-grid').innerHTML = PRESETS.map(p => `
+    <div class="preset-item ${activePreset===p.id?'selected':''}" onclick="selectPreset('${p.id}')">
+      <div class="pi-name">${p.name}</div>
+      <div class="pi-lang">${p.lang}</div>
+    </div>`).join('');
+}
+
+function selectPreset(id) {
+  const p = PRESETS.find(x=>x.id===id); if(!p) return;
+  activePreset = id;
+  mG = { V:[...p.V], T:[...p.T], S:p.S, P:JSON.parse(JSON.stringify(p.P)) };
+  syncModalUI();
+  renderPresetGrid();
+}
+
+// ══════════════════════════════════════════════════════════
+//  MODAL SYNC
+// ══════════════════════════════════════════════════════════
+function syncModalUI() {
+  renderMVars(); renderMTerms(); renderMStartSel(); renderMProds();
+}
+
+function renderMVars() {
+  const el = document.getElementById('m-var-pills');
+  el.innerHTML = mG.V.length
+    ? mG.V.map(v=>`<div class="alpha-pill var-p">${v}${v===mG.S?'<span class="start-badge">START</span>':''}
+        <button onclick="mRemoveVar('${v}')">&#215;</button></div>`).join('')
+    : '<span style="font-size:11px;color:var(--muted);font-style:italic">No variables yet...</span>';
+}
+
+function renderMTerms() {
+  const el = document.getElementById('m-term-pills');
+  el.innerHTML = mG.T.length
+    ? mG.T.map(t=>`<div class="alpha-pill term-p">${escH(t)}
+        <button onclick="mRemoveTerm('${escH(t)}')">&#215;</button></div>`).join('')
+    : '<span style="font-size:11px;color:var(--muted);font-style:italic">No terminals yet...</span>';
+}
+
+function renderMStartSel() {
+  const sel = document.getElementById('m-start');
+  sel.innerHTML = '<option value="">-- select --</option>' +
+    mG.V.map(v=>`<option value="${v}" ${v===mG.S?'selected':''}>${v}</option>`).join('');
+}
+
+function renderMProds() {
+  const el   = document.getElementById('m-prod-rows');
+  const form = document.getElementById('m-add-prod-form');
+  const lhs  = document.getElementById('m-lhs-sel');
+  if(!mG.V.length){el.innerHTML='<div style="font-size:11px;color:var(--muted);font-style:italic">Add variables first...</div>';form.style.display='none';return;}
+  form.style.display='flex';
+  lhs.innerHTML = mG.V.map(v=>`<option value="${v}">${v}</option>`).join('');
+  el.innerHTML = mG.V.map(v=>{
+    const rules = mG.P[v]||[];
+    return `<div class="prod-row-m">
+      <div class="prm-lhs">${v}</div>
+      <div class="prm-arrow">&#8594;</div>
+      <div class="prm-rhs">${rules.map((r,i)=>`<div class="rhs-tag">${r===EPS?EPS_SHOW:escH(r)}<button onclick="mRemoveProd('${v}',${i})">&#215;</button></div>`).join('')}
+        <button class="rhs-add-btn" onclick="mFocusAdd('${v}')" title="Add rule">+</button>
+      </div>
+      <button class="prm-del" onclick="mClearVar('${v}')" title="Clear">&#10005;</button>
+    </div>`;
+  }).join('');
+}
+
+function mFocusAdd(v){document.getElementById('m-lhs-sel').value=v;document.getElementById('m-rhs-inp').focus();}
+
+function mAddVar(){
+  const v=document.getElementById('m-var-inp').value.trim().toUpperCase();
+  if(!v){showModalMsg('Enter a variable name','err');return;}
+  if(mG.V.includes(v)){showModalMsg('Variable already exists','err');return;}
+  mG.V.push(v);mG.P[v]=[];
+  if(!mG.S)mG.S=v;
+  document.getElementById('m-var-inp').value='';
+  activePreset=null;syncModalUI();renderPresetGrid();
+}
+function mRemoveVar(v){mG.V=mG.V.filter(x=>x!==v);delete mG.P[v];if(mG.S===v)mG.S=mG.V[0]||'';activePreset=null;syncModalUI();renderPresetGrid();}
+function mAddTerm(){
+  const t=document.getElementById('m-term-inp').value.trim();
+  if(!t){showModalMsg('Enter a terminal symbol','err');return;}
+  if(mG.T.includes(t)){showModalMsg('Terminal already exists','err');return;}
+  mG.T.push(t);document.getElementById('m-term-inp').value='';activePreset=null;syncModalUI();renderPresetGrid();
+}
+function mAddTermSet(arr){arr.forEach(t=>{if(!mG.T.includes(t))mG.T.push(t);});activePreset=null;syncModalUI();renderPresetGrid();}
+function mRemoveTerm(t){mG.T=mG.T.filter(x=>x!==t);activePreset=null;syncModalUI();renderPresetGrid();}
+function mAddProd(){
+  const lhs=document.getElementById('m-lhs-sel').value;
+  let rhs=document.getElementById('m-rhs-inp').value.trim();
+  if(!lhs||!rhs){showModalMsg('Select variable and enter production','err');return;}
+  if(rhs===EPS_SHOW||rhs==='eps'||rhs==='epsilon')rhs=EPS;
+  if(!mG.P[lhs])mG.P[lhs]=[];
+  if(mG.P[lhs].includes(rhs)){showModalMsg('Rule already exists','err');return;}
+  mG.P[lhs].push(rhs);document.getElementById('m-rhs-inp').value='';activePreset=null;syncModalUI();renderPresetGrid();
+}
+function mRemoveProd(v,i){mG.P[v].splice(i,1);syncModalUI();}
+function mClearVar(v){mG.P[v]=[];syncModalUI();}
+
+function showModalMsg(text,type){
+  const el=document.getElementById('modal-msg');
+  if(!text){el.className='modal-msg';el.textContent='';return;}
+  el.className='modal-msg '+type;el.textContent=text;
+}
+
+// ══════════════════════════════════════════════════════════
+//  MODAL OPEN / CLOSE / APPLY
+// ══════════════════════════════════════════════════════════
+function openGrammarModal(){
+  // Pre-populate with current grammar if exists
+  if(G){mG=JSON.parse(JSON.stringify({V:G.V,T:G.T,S:G.S,P:G.P}));}
+  else{mG={V:[],T:[],S:'',P:{}};}
+  showModalMsg('','');
+  syncModalUI();renderPresetGrid();
+  document.getElementById('grammar-modal').classList.add('open');
+}
+function closeGrammarModal(){document.getElementById('grammar-modal').classList.remove('open');}
+
+function applyGrammar(){
+  mG.S=document.getElementById('m-start').value||mG.S;
+  if(!mG.V.length){showModalMsg('Add at least one variable','err');return;}
+  if(!mG.T.length){showModalMsg('Add at least one terminal','err');return;}
+  if(!mG.S){showModalMsg('Select a start symbol','err');return;}
+  if(!mG.V.includes(mG.S)){showModalMsg('Start symbol must be a variable','err');return;}
+  const totalRules=Object.values(mG.P).reduce((s,r)=>s+r.length,0);
+  if(!totalRules){showModalMsg('Add at least one production rule','err');return;}
+
+  G=JSON.parse(JSON.stringify({V:mG.V,T:mG.T,S:mG.S,P:mG.P}));
+  buildPDA();
+  updateSidebarGrammar();
+  layoutPDA();
+  drawPDA(null,null);
+  showSidebarSections();
+  resetSim();
+  closeGrammarModal();
+  setBadge('ok','Grammar loaded — '+G.V.length+' vars, '+G.T.length+' terminals');
+  setBar('CFG→PDA ready: '+G.V.length+' variables, '+G.T.length+' terminals, '+pda.trans.length+' transitions');
+  document.getElementById('canvas-hint').style.display='none';
+  toast('Grammar applied successfully!');
+}
+
+// ══════════════════════════════════════════════════════════
+//  BUILD PDA (silent)
+// ══════════════════════════════════════════════════════════
+function buildPDA(){
+  const Z0='Z\u2080';
+  const tr=[];
+  tr.push({from:'q0',inp:EPS,pop:EPS,to:'q_loop',push:G.S+' '+Z0,type:'init',rule:'Init: push '+G.S+' then '+Z0});
+  for(const A of G.V)for(const rhs of(G.P[A]||[]))
+    tr.push({from:'q_loop',inp:EPS,pop:A,to:'q_loop',push:rhs===EPS?EPS:rhs,type:'expand',rule:A+' \u2192 '+(rhs===EPS?EPS_SHOW:rhs)});
+  for(const a of G.T)
+    tr.push({from:'q_loop',inp:a,pop:a,to:'q_loop',push:EPS,type:'match',rule:"Match '"+a+"'"});
+  tr.push({from:'q_loop',inp:EPS,pop:Z0,to:'q_acc',push:EPS,type:'accept',rule:'Accept \u2014 Z\u2080 popped'});
+  pda={states:['q0','q_loop','q_acc'],start:'q0',accept:['q_acc'],Z0,
+    stackAlpha:[Z0,...G.V,...G.T],inputAlpha:G.T,trans:tr};
+}
+
+// ══════════════════════════════════════════════════════════
+//  SVG LAYOUT
+// ══════════════════════════════════════════════════════════
+const R=38, RO=52;
+const NC_DARK={q0:'#818cf8', q_loop:'#22d3ee', q_acc:'#10b981'};
+const NC_LIGHT={q0:'#4f46e5', q_loop:'#0891b2', q_acc:'#059669'};
+const NC=new Proxy({},{get:(_,k)=>(document.documentElement.classList.contains('light')?NC_LIGHT:NC_DARK)[k]});
+
+function layoutPDA(){
+  const svg=document.getElementById('svg-canvas');
+  const W=svg.clientWidth||900, H=svg.clientHeight||600;
+  // Horizontal layout: q0 left, q_loop center, q_acc right
+  const cy=H*0.50;
+  const xSpan=Math.min(W*0.7,480);
+  const cx=W/2;
+  nodePos={
+    q0:     {x:cx-xSpan/2, y:cy},
+    q_loop: {x:cx,         y:cy},
+    q_acc:  {x:cx+xSpan/2, y:cy},
+  };
+  vx=0;vy=0;vz=1;
+  setViewport();
+}
+
+// ══════════════════════════════════════════════════════════
+//  SVG DRAW
+// ══════════════════════════════════════════════════════════
+function makeEl(tag){return document.createElementNS('http://www.w3.org/2000/svg',tag);}
+function attr(el,obj){Object.entries(obj).forEach(([k,v])=>el.setAttribute(k,v));return el;}
+function makeLine(p,x1,y1,x2,y2,props){const l=makeEl('line');attr(l,{x1,y1,x2,y2,...props});p.appendChild(l);return l;}
+function makeText(p,x,y,txt,props){const t=makeEl('text');attr(t,{x,y,...props});t.textContent=txt;p.appendChild(t);return t;}
+function makeRect(p,x,y,w,h,rx,props){const r=makeEl('rect');attr(r,{x,y,width:w,height:h,rx,...props});p.appendChild(r);return r;}
+
+function drawPDA(activeState, activeTransId){
+  const vp=document.getElementById('viewport');
+  vp.innerHTML='';
+  if(!pda)return;
+
+  const expandT=pda.trans.filter(t=>t.type==='expand');
+  const matchT =pda.trans.filter(t=>t.type==='match');
+  const initT  =pda.trans.filter(t=>t.type==='init');
+  const acceptT=pda.trans.filter(t=>t.type==='accept');
+
+  function isActiveTrans(t){return activeTransId&&(t.from+t.inp+t.pop+t.to+t.push===activeTransId);}
+
+  // ── PASS 1: Draw nodes first (circles only, no labels) ─────
+  ['q0','q_loop','q_acc'].forEach(name=>{
+    drawStateNode(vp,name,nodePos[name],name===activeState);
+  });
+
+  // ── PASS 2: Draw all edges ON TOP of node fills ───────────
+  // Start arrow
+  const q0=nodePos.q0;
+  const isLightSA=document.documentElement.classList.contains('light');
+  makeLine(vp,q0.x-R-60,q0.y,q0.x-R-2,q0.y,{stroke:isLightSA?'#64748b':'#475569','stroke-width':2,'marker-end':isLightSA?'url(#arr-dark)':'url(#arr)'});
+  makeText(vp,q0.x-R-32,q0.y-10,'start',{fill:isLightSA?'#4f46e5':'#818cf8','font-size':11,'text-anchor':'middle','font-family':'Inter','font-weight':'600'});
+
+  // ── q0 → q_loop (INIT) ────────────────────────────────────
+  {
+    const isLight=document.documentElement.classList.contains('light');
+    const hl=initT.some(isActiveTrans);
+    const col=hl?'#f59e0b':(isLight?'#4f46e5':'#818cf8');
+    const mk=hl?'url(#arr-y)':(isLight?'url(#arr-dark)':'url(#arr)');
+    drawEdge(vp,nodePos.q0,nodePos.q_loop,initT,isActiveTrans,col,mk,0,false);
+  }
+
+  // ── q_loop EXPAND loop (above) ────────────────────────────
+  if(expandT.length){
+    const isLight=document.documentElement.classList.contains('light');
+    const hl=expandT.some(isActiveTrans);
+    const col=hl?'#f59e0b':(isLight?'#0891b2':'#22d3ee');
+    const mk=hl?'url(#arr-y)':(isLight?'url(#arr-cyan-dark)':'url(#arr-c)');
+    drawSelfLoop(vp,nodePos.q_loop,expandT,isActiveTrans,col,mk,'top');
+  }
+
+  // ── q_loop MATCH loop (below) ─────────────────────────────
+  if(matchT.length){
+    const isLight=document.documentElement.classList.contains('light');
+    const hl=matchT.some(isActiveTrans);
+    const col=hl?'#f59e0b':(isLight?'#0891b2':'#22d3ee');
+    const mk=hl?'url(#arr-y)':(isLight?'url(#arr-cyan-dark)':'url(#arr-c)');
+    drawSelfLoop(vp,nodePos.q_loop,matchT,isActiveTrans,col,mk,'bottom');
+  }
+
+  // ── q_loop → q_acc (ACCEPT) ───────────────────────────────
+  {
+    const isLight=document.documentElement.classList.contains('light');
+    const hl=acceptT.some(isActiveTrans);
+    const col=hl?'#f59e0b':(isLight?'#0891b2':'#22d3ee');
+    const mk=hl?'url(#arr-y)':(isLight?'url(#arr-cyan-dark)':'url(#arr-c)');
+    drawEdge(vp,nodePos.q_loop,nodePos.q_acc,acceptT,isActiveTrans,col,mk,0,false);
+  }
+
+  // ── PASS 3: Redraw state labels on very top so text is readable
+  ['q0','q_loop','q_acc'].forEach(name=>{
+    const p=nodePos[name];
+    const active=name===activeState;
+    const col=NC[name]||'#818cf8';
+    // In light mode, non-active labels need enough contrast against white fill
+    const lblCol=active?'#d97706':col;
+    makeText(vp,p.x,p.y+4,name,{fill:lblCol,
+      'font-size':12,'font-weight':700,'text-anchor':'middle',
+      style:'pointer-events:none','font-family':'JetBrains Mono'});
+  });
+}
+
+function drawEdge(vp,p1,p2,transList,isActiveFn,col,marker,curveOffset,bidir){
+  const dx=p2.x-p1.x,dy=p2.y-p1.y,dist=Math.sqrt(dx*dx+dy*dy);
+  const ux=dx/dist,uy=dy/dist,px=-uy,py=ux;
+  const x1=p1.x+ux*(R+2)+px*curveOffset, y1=p1.y+uy*(R+2)+py*curveOffset;
+  const x2=p2.x-ux*(R+2)+px*curveOffset, y2=p2.y-uy*(R+2)+py*curveOffset;
+  const mx=(p1.x+p2.x)/2+px*(bidir?50:0), my=(p1.y+p2.y)/2+py*(bidir?50:0);
+
+  const d=bidir?`M ${x1} ${y1} Q ${mx} ${my} ${x2} ${y2}`:`M ${x1} ${y1} L ${x2} ${y2}`;
+  const path=makeEl('path');
+  const edgeHl=transList.some(isActiveFn);
+  attr(path,{d,stroke:col,'stroke-width':edgeHl?3.5:2,fill:'none','marker-end':marker});
+  vp.appendChild(path);
+
+  // Label(s)
+  const lx=bidir?mx:(x1+x2)/2+px*22, ly=bidir?my:(y1+y2)/2+py*22;
+  transList.forEach((t,i)=>{
+    const hl=isActiveFn(t);
+    const labelY=ly+i*22-(transList.length-1)*11;
+    drawTransLabel(vp,lx,labelY,fmtTrans(t),hl);
+  });
+}
+
+function drawSelfLoop(vp,p,transList,isActiveFn,col,marker,side){
+  const loopR=62, spread=0.52;
+  const angle=side==='top'?-Math.PI/2:Math.PI/2;
+  const a1=angle-spread, a2=angle+spread;
+  const sx=p.x+Math.cos(a1)*R, sy=p.y+Math.sin(a1)*R;
+  const ex=p.x+Math.cos(a2)*(R-4), ey=p.y+Math.sin(a2)*(R-4);
+  const c1x=p.x+Math.cos(a1)*(R+loopR*1.9), c1y=p.y+Math.sin(a1)*(R+loopR*1.9);
+  const c2x=p.x+Math.cos(a2)*(R+loopR*1.9), c2y=p.y+Math.sin(a2)*(R+loopR*1.9);
+
+  const path=makeEl('path');
+  const loopHl=transList.some(isActiveFn);
+  attr(path,{d:`M ${sx} ${sy} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${ex} ${ey}`,
+    stroke:col,'stroke-width':loopHl?3.5:2,fill:'none','marker-end':marker});
+  vp.appendChild(path);
+
+  // Labels above/below the loop tip
+  const tipX=p.x+Math.cos(angle)*(R+loopR*2.2);
+  const tipY=p.y+Math.sin(angle)*(R+loopR*2.2);
+  const dirY=side==='top'?-1:1;
+  transList.forEach((t,i)=>{
+    const hl=isActiveFn(t);
+    const ly=tipY+dirY*(i*22)-(transList.length-1)*11*dirY;
+    drawTransLabel(vp,tipX,ly,fmtTrans(t),hl);
+  });
+}
+
+function drawTransLabel(vp,x,y,label,hl){
+  const w=label.length*8+20;
+  const isLight=document.documentElement.classList.contains('light');
+  // Background: highlighted = strong amber fill; normal = themed bg
+  const lblBg=hl?'#f59e0b':(isLight?'#ffffff':'#0f172a');
+  const lblBorder=hl?'#d97706':(isLight?'#cbd5e1':'#334155');
+  makeRect(vp,x-w/2,y-13,w,24,4,{fill:lblBg,opacity:1,
+    stroke:lblBorder,'stroke-width':hl?2:1.2});
+  // Text: on amber bg always use dark; on light bg use dark; on dark bg use light
+  const lblTxt=hl?'#0f172a':(isLight?'#0f172a':'#f8fafc');
+  makeText(vp,x,y+5,label,{fill:lblTxt,
+    'font-size':12,'font-weight':hl?700:600,'text-anchor':'middle',
+    style:'pointer-events:none','font-family':'JetBrains Mono'});
+}
+
+function drawStateNode(vp,name,p,active){
+  const col=NC[name]||'#818cf8';
+  const isAcc=pda.accept.includes(name);
+  const isLight=document.documentElement.classList.contains('light');
+  const fillBg=active?(isLight?'rgba(245,158,11,.18)':'rgba(245,158,11,.12)'):(isLight?'rgba(248,250,252,.95)':'rgba(15,23,42,.9)');
+
+  if(isAcc){
+    const oc=makeEl('circle');
+    attr(oc,{cx:p.x,cy:p.y,r:RO,fill:'none',
+      stroke:active?'#f59e0b':col,'stroke-width':active?3:2.5});
+    if(active)oc.setAttribute('filter','url(#glow)');
+    vp.appendChild(oc);
+  }
+
+  const c=makeEl('circle');
+  attr(c,{cx:p.x,cy:p.y,r:R,fill:fillBg,
+    stroke:active?'#f59e0b':col,'stroke-width':active?3.5:2.5,style:'cursor:move'});
+  if(active)c.setAttribute('filter','url(#glow)');
+  c.setAttribute('data-name',name);
+  c.addEventListener('mousedown',e=>{e.stopPropagation();draggingNode=name;});
+  vp.appendChild(c);
+
+  // State name
+  makeText(vp,p.x,p.y+4,name,{fill:active?'#f59e0b':col,
+    'font-size':12,'font-weight':700,'text-anchor':'middle',
+    style:'pointer-events:none','font-family':'JetBrains Mono'});
+}
+
+function fmtTrans(t){
+  const e=EPS_SHOW,ar='\u2192';
+  const i=t.inp===EPS?e:t.inp;
+  const p=t.pop===EPS?e:t.pop;
+  const u=t.push===EPS?e:t.push;
+  return i+', '+p+' '+ar+' '+u;
+}
+
+// ══════════════════════════════════════════════════════════
+//  SVG PAN / ZOOM / DRAG
+// ══════════════════════════════════════════════════════════
+function initSVGPan(){
+  const svg=document.getElementById('svg-canvas');
+  svg.addEventListener('mousedown',e=>{
+    if(draggingNode)return;
+    dragging=true;dragStart={x:e.clientX-vx,y:e.clientY-vy};
+    svg.style.cursor='grabbing';
+  });
+  window.addEventListener('mousemove',e=>{
+    if(draggingNode){
+      const pt=svgPoint(e.clientX,e.clientY);
+      nodePos[draggingNode]={x:pt.x,y:pt.y};
+      drawPDA(null,null);return;
+    }
+    if(!dragging)return;
+    vx=e.clientX-dragStart.x;vy=e.clientY-dragStart.y;setViewport();
+  });
+  window.addEventListener('mouseup',()=>{
+    dragging=false;draggingNode=null;
+    document.getElementById('svg-canvas').style.cursor='grab';
+  });
+  svg.addEventListener('wheel',e=>{
+    e.preventDefault();
+    const factor=e.deltaY<0?1.12:0.89;
+    const rect=svg.getBoundingClientRect();
+    const mx=e.clientX-rect.left,my=e.clientY-rect.top;
+    vx=(vx-mx)*factor+mx;vy=(vy-my)*factor+my;vz*=factor;
+    setViewport();
+  });
+}
+
+function svgPoint(cx,cy){
+  const svg=document.getElementById('svg-canvas');
+  const rect=svg.getBoundingClientRect();
+  return {x:(cx-rect.left-vx)/vz,y:(cy-rect.top-vy)/vz};
+}
+
+function setViewport(){
+  document.getElementById('viewport').setAttribute('transform',`translate(${vx},${vy}) scale(${vz})`);
+}
+
+function zoomBy(f){
+  const svg=document.getElementById('svg-canvas');
+  const cx=svg.clientWidth/2,cy=svg.clientHeight/2;
+  vx=(vx-cx)*f+cx;vy=(vy-cy)*f+cy;vz*=f;setViewport();
+}
+
+function fitView(){
+  if(!pda)return;
+  const svg=document.getElementById('svg-canvas');
+  const W=svg.clientWidth,H=svg.clientHeight;
+  const positions=Object.values(nodePos);
+  const minX=Math.min(...positions.map(p=>p.x))-80;
+  const maxX=Math.max(...positions.map(p=>p.x))+80;
+  const minY=Math.min(...positions.map(p=>p.y))-120;
+  const maxY=Math.max(...positions.map(p=>p.y))+120;
+  const fw=maxX-minX,fh=maxY-minY;
+  const scale=Math.min(W/fw,H/fh,1.5)*0.85;
+  vz=scale;
+  vx=W/2-(minX+fw/2)*scale;
+  vy=H/2-(minY+fh/2)*scale;
+  setViewport();
+}
+
+// ══════════════════════════════════════════════════════════
+//  SIMULATION ENGINE
+// ══════════════════════════════════════════════════════════
+function startSim(){
+  if(!pda){toast('Build a grammar first','err');return;}
+  stopPlay();
+  const raw=document.getElementById('sim-input').value;
+  simInput=(raw===''||raw===EPS_SHOW)?[]:raw.split('');
+
+  // Validate alphabet
+  for(const ch of simInput){
+    if(!G.T.includes(ch)){toast("'"+ch+"' not in alphabet {"+G.T.join(',')+"}",'err');return;}
+  }
+
+  // Build trace then prepend synthetic step-0 (initial config before any transition)
+  const trace=computeTrace(simInput);
+  const step0={
+    stepNum:0, state:pda.start, stateTo:pda.start,
+    pos:0, posAfter:0, inputArr:simInput,
+    stackBefore:[], stackAfter:[],
+    stackTop:'-', t:null, inputRead:'-', popSym:'-',
+    rule:'Initial configuration — no transition yet',
+    action:'START', accepted:false, dead:false, isInitial:true
+  };
+  simSteps=[step0, ...trace];
+  simCur=0;
+  renderTrace([]);
+  applySimStep(0);
+  enableSimBtns(true);
+  setBar('Simulating "'+( raw||EPS_SHOW)+'" — '+(simSteps.length-1)+' steps');
+  document.getElementById('canvas-stack').classList.add('visible');
+  document.getElementById('canvas-tape').classList.add('visible');
+  document.getElementById('trace-sec').style.display='';
+  document.getElementById('stack-sec').style.display='';
+}
+
+function computeTrace(inputArr){
+  const Z0=pda.Z0;
+  function getTrans(state,sym,top){
+    return pda.trans.filter(t=>t.from===state&&(t.inp===EPS||t.inp===sym)&&(t.pop===EPS||t.pop===top));
+  }
+  function tokPush(s){
+    if(!s||s===EPS)return[];
+    const syms=[],alpha=[...pda.stackAlpha].sort((a,b)=>b.length-a.length);
+    let i=0;
+    while(i<s.length){
+      if(s[i]===' '){i++;continue;}
+      let hit=false;
+      for(const x of alpha){if(s.startsWith(x,i)){syms.push(x);i+=x.length;hit=true;break;}}
+      if(!hit){syms.push(s[i]);i++;}
+    }
+    return syms;
+  }
+  const dfs=[{state:pda.start,pos:0,stack:[],log:[]}];
+  const seen=new Set();let accept=null,best=null;const MAX=200;
+  while(dfs.length&&!accept){
+    const cfg=dfs.pop();
+    const key=cfg.state+'|'+cfg.pos+'|'+cfg.stack.join(',');
+    if(seen.has(key)||cfg.log.length>=MAX)continue;
+    seen.add(key);
+    const top=cfg.stack[cfg.stack.length-1]??null;
+    const sym=cfg.pos<inputArr.length?inputArr[cfg.pos]:null;
+    if(pda.accept.includes(cfg.state)&&cfg.pos>=inputArr.length){accept=cfg;break;}
+    const ap=getTrans(cfg.state,sym,top);
+    if(!ap.length){if(!best||cfg.log.length>best.log.length)best=cfg;continue;}
+    for(let i=ap.length-1;i>=0;i--){
+      const t=ap[i],ns=[...cfg.stack];
+      if(t.pop!==EPS)ns.pop();
+      if(t.push!==EPS){const ps=tokPush(t.push);for(let j=ps.length-1;j>=0;j--)ns.push(ps[j]);}
+      const np=(t.inp!==EPS&&sym!==null)?cfg.pos+1:cfg.pos;
+      dfs.push({state:t.to,pos:np,stack:ns,log:[...cfg.log,{t,state:cfg.state,pos:cfg.pos,stackBefore:[...cfg.stack],stackAfter:ns}]});
+    }
+  }
+  const trace=accept||best;const accepted=!!accept;
+  if(!trace||!trace.log.length)return[{stepNum:1,state:pda.start,stateTo:pda.start,pos:0,inputArr,
+    stackBefore:[],stackAfter:[],t:null,inputRead:EPS_SHOW,popSym:'-',rule:'No applicable transition',action:'REJECT',accepted:false,dead:true}];
+  const result=trace.log.map((e,i)=>{
+    const np=e.t.inp!==EPS&&e.pos<inputArr.length?e.pos+1:e.pos;
+    return{stepNum:i+1,state:e.state,stateTo:e.t.to,pos:e.pos,posAfter:np,inputArr,
+      stackBefore:e.stackBefore,stackAfter:e.stackAfter,
+      stackTop:e.stackBefore[e.stackBefore.length-1]||'-',
+      t:e.t,inputRead:e.t.inp===EPS?EPS_SHOW:(inputArr[e.pos]??'-'),
+      popSym:e.t.pop===EPS?EPS_SHOW:e.t.pop,
+      rule:e.t.rule,action:e.t.type.toUpperCase(),accepted:false,dead:false};
+  });
+  const last=trace.log[trace.log.length-1];
+  const fState=last.t.to,fPos=last.t.inp!==EPS?last.pos+1:last.pos,fStack=last.stackAfter;
+  result.push({stepNum:result.length+1,state:fState,stateTo:fState,pos:fPos,posAfter:fPos,inputArr,
+    stackBefore:fStack,stackAfter:fStack,stackTop:fStack[fStack.length-1]||'-',
+    t:null,inputRead:'-',popSym:'-',
+    rule:accepted?'All input consumed \u2014 accept state reached':'No valid path to accept state',
+    action:accepted?'ACCEPT':'REJECT',accepted,dead:!accepted});
+  return result;
+}
+
+// ══════════════════════════════════════════════════════════
+//  APPLY STEP
+// ══════════════════════════════════════════════════════════
+function applySimStep(i){
+  if(!simSteps.length)return;
+  i=Math.max(0,Math.min(simSteps.length-1,i));
+  simCur=i;
+  const s=simSteps[i];
+
+  // Draw PDA — highlight current state + the transition that JUST fired
+  // For step-0 (initial), no transition active, just show start state
+  const tId=s.t?(s.t.from+s.t.inp+s.t.pop+s.t.to+s.t.push):null;
+  drawPDA(s.state, tId);
+
+  // Sidebar state pills
+  document.querySelectorAll('.state-pill').forEach(el=>{
+    const n=el.querySelector('.sp-name').textContent;
+    el.classList.toggle('sp-active',n===s.state);
+  });
+
+  // Tape + Stack: show BEFORE state — configuration at the moment this transition
+  // is about to fire (tape head on the symbol being read, stack before any pop).
+  // Both are in sync. For the final verdict step show the fully-resolved after state.
+  const tapeHead = (s.accepted || s.dead)
+    ? (s.posAfter != null ? s.posAfter : s.pos)
+    : s.pos;
+  renderCharRow(s.inputArr, tapeHead - 1);
+  renderCanvasTape(s.inputArr, tapeHead);
+
+  const showStack = (s.accepted || s.dead)
+    ? (s.stackAfter || s.stackBefore || [])
+    : (s.stackBefore || []);
+  renderStackDisplay(showStack);
+  renderCanvasStack(showStack);
+
+  // Trace log (skip step-0)
+  addTraceLines(i);
+
+  // Status bar
+  if(!s.isInitial && !s.accepted && !s.dead){
+    const inputLeft = s.inputArr.slice(tapeHead).join('') || EPS_SHOW;
+    setBar('Step '+i+' / '+(simSteps.length-1)
+      +' — '+s.state
+      +' — input left: "'+inputLeft+'"'
+      +' — stack: '+(showStack.length||0));
+  }
+
+  // Final verdict
+  if(i===simSteps.length-1){
+    const raw=document.getElementById('sim-input').value||EPS_SHOW;
+    const res=document.getElementById('result');
+    if(s.accepted){
+      res.innerHTML='<div class="result-box res-accept">✓ ACCEPTED<div class="res-sub">"'+escH(raw)+'" is in the language</div></div>';
+      setBadge('ok','"'+raw+'" ACCEPTED');
+    }else if(s.dead){
+      res.innerHTML='<div class="result-box res-reject">✗ REJECTED<div class="res-sub">"'+escH(raw)+'" is not in the language</div></div>';
+      setBadge('err','"'+raw+'" REJECTED');
+    }
+    stopPlay();
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+//  SIMULATION CONTROLS
+// ══════════════════════════════════════════════════════════
+function stepSim(){
+  if(simCur===-1){startSim();return;}
+  if(simCur<simSteps.length-1)applySimStep(simCur+1);
+}
+function runAll(){
+  if(isPlaying){stopPlay();return;}
+  startSim();
+  isPlaying=true;
+  document.getElementById('btn-run').textContent='⏸ PAUSE';
+  schedPlay();
+}
+function stopPlay(){
+  isPlaying=false;clearTimeout(playTimer);
+  document.getElementById('btn-run').textContent='RUN';
+}
+function schedPlay(){
+  if(!isPlaying)return;
+  playTimer=setTimeout(()=>{
+    if(simCur<simSteps.length-1){applySimStep(simCur+1);schedPlay();}
+    else stopPlay();
+  },420);
+}
+function resetSim(){
+  stopPlay();simSteps=[];simCur=-1;simInput=[];
+  document.getElementById('char-row').innerHTML='';
+  document.getElementById('trace').innerHTML='<div class="trace-line" style="font-style:italic;justify-content:center;color:var(--muted)">Press STEP or RUN to start...</div>';
+  document.getElementById('result').innerHTML='';
+  renderStackDisplay([]);renderCanvasStack([]);
+  renderCanvasTape([],0);
+  document.getElementById('canvas-stack').classList.remove('visible');
+  document.getElementById('canvas-tape').classList.remove('visible');
+  if(G)drawPDA(null,null);
+  document.querySelectorAll('.state-pill').forEach(el=>el.classList.remove('sp-active'));
+  enableSimBtns(false);
+  if(G)setBar('Ready. Enter an input string and press STEP or RUN.');
+}
+function enableSimBtns(on){
+  ['btn-step','btn-run','btn-reset'].forEach(id=>document.getElementById(id).disabled=!on);
+  document.getElementById('btn-step').disabled=false;
+  document.getElementById('btn-run').disabled=false;
+}
+
+// ══════════════════════════════════════════════════════════
+//  RENDER HELPERS
+// ══════════════════════════════════════════════════════════
+function renderCharRow(inputArr,headPos){
+  const el=document.getElementById('char-row');
+  if(!inputArr||!inputArr.length){el.innerHTML='<span style="font-size:11px;color:var(--muted);font-style:italic">empty string ('+EPS_SHOW+')</span>';return;}
+  el.innerHTML=inputArr.map((ch,i)=>{
+    let cls='ch';
+    if(i<headPos)cls+=' done';
+    else if(i===headPos)cls+=' active';
+    return'<div class="'+cls+'">'+escH(ch)+'</div>';
+  }).join('');
+}
+
+function renderCanvasTape(inputArr,headPos){
+  const el=document.getElementById('ct-cells');
+  if(!inputArr||!inputArr.length){el.innerHTML='<span style="font-family:var(--font-mono);font-size:12px;color:var(--cyan)">'+EPS_SHOW+'</span>';return;}
+  el.innerHTML=inputArr.map((ch,i)=>{
+    let cls='ct-cell';
+    if(i<headPos)cls+=' ct-done';
+    else if(i===headPos)cls+=' ct-head';
+    else cls+=' ct-rem';
+    return'<div class="'+cls+'">'+escH(ch)+'<span class="ct-idx">'+i+'</span></div>';
+  }).join('');
+}
+
+function renderStackDisplay(stack){
+  const el=document.getElementById('stack-display');
+  const dl=document.getElementById('stack-depth-lbl');
+  if(!stack||!stack.length){
+    el.innerHTML='<div style="font-size:11px;color:var(--muted);font-style:italic;text-align:center;padding:8px">Stack empty</div>';
+    if(dl)dl.textContent='';return;
+  }
+  if(dl)dl.textContent='(depth: '+stack.length+')';
+  const V=new Set(G.V||[]),Z0=pda.Z0;
+  el.innerHTML=[...stack].reverse().map((sym,i)=>{
+    let cls='sk-cell';
+    if(i===0)cls+=' sk-top';
+    else if(sym===Z0)cls+=' sk-bot';
+    else if(V.has(sym))cls+=' sk-var';
+    else cls+=' sk-term';
+    return'<div class="'+cls+'"><span>'+escH(sym)+'</span><span class="sk-tag">'+(i===0?'TOP':sym===Z0?'BOTTOM':'')+'</span></div>';
+  }).join('');
+}
+
+function renderCanvasStack(stack){
+  const el=document.getElementById('cs-cells');
+  if(!stack||!stack.length){el.innerHTML='<div style="font-size:10px;color:var(--muted);text-align:center;padding:6px;font-style:italic">empty</div>';return;}
+  const V=new Set(G.V||[]),Z0=pda.Z0;
+  el.innerHTML=[...stack].reverse().map((sym,i)=>{
+    let cls='cs-cell';
+    if(i===0)cls+=' cs-top';
+    else if(sym===Z0)cls+=' cs-bot';
+    else if(V.has(sym))cls+=' cs-var';
+    else cls+=' cs-term';
+    return'<div class="'+cls+'">'+escH(sym)+(i===0?'<span class="cs-lbl">TOP</span>':sym===Z0?'<span class="cs-lbl">BOT</span>':'')+'</div>';
+  }).join('');
+}
+
+function addTraceLines(stepIdx){
+  const el=document.getElementById('trace');
+  el.innerHTML='';
+  simSteps.slice(0,stepIdx+1).forEach(s=>{
+    if(s.isInitial)return;
+    const line=document.createElement('div');
+    line.className='trace-line';
+    if(s.accepted){line.innerHTML='<span class="tl-accept">\u2713 ACCEPTED</span><span class="tl-rule">'+escH(s.rule)+'</span>';}
+    else if(s.dead){line.innerHTML='<span class="tl-reject">\u2717 REJECTED</span><span class="tl-rule">'+escH(s.rule)+'</span>';}
+    else{line.innerHTML='<span class="tl-state">'+s.state+'</span>'+(s.inputRead&&s.inputRead!=='-'?'<span class="tl-sym">'+escH(s.inputRead)+'</span>':'')+'<span class="tl-action">'+s.action+'</span><span class="tl-rule">'+escH(s.rule||'')+'</span>';}
+    el.appendChild(line);
+  });
+  el.scrollTop=el.scrollHeight;
+}
+
+function renderTrace(lines){document.getElementById('trace').innerHTML='<div class="trace-line" style="font-style:italic;justify-content:center;color:var(--muted)">Press STEP or RUN to start...</div>';}
+
+// ══════════════════════════════════════════════════════════
+//  SIDEBAR SECTIONS
+// ══════════════════════════════════════════════════════════
+function updateSidebarGrammar(){
+  const notation=document.getElementById('grammar-notation');
+  notation.innerHTML=G.V.map(v=>{
+    const rules=(G.P[v]||[]);
+    if(!rules.length)return'<div><span class="gn-var">'+v+'</span> <span class="gn-arrow">\u2192</span> <span style="color:var(--muted)">\u2205</span></div>';
+    const rhs=rules.map(r=>r===EPS?'<span class="gn-eps">'+EPS_SHOW+'</span>':
+      r.split('').map(ch=>G.V.includes(ch)?'<span class="gn-var">'+ch+'</span>':'<span class="gn-term">'+escH(ch)+'</span>').join('')
+    ).join(' <span class="gn-pipe">|</span> ');
+    return'<div><span class="gn-var">'+v+'</span> <span class="gn-arrow">\u2192</span> '+rhs+'</div>';
+  }).join('');
+
+  const totalRules=Object.values(G.P).reduce((s,r)=>s+r.length,0);
+  document.getElementById('grammar-card').innerHTML=
+    '<span>'+escH(G.name||(PRESETS.find(p=>p.id===activePreset)?.name||'Custom Grammar'))+'</span><br>'
+    +'<div style="margin-top:4px">V={'+G.V.join(', ')+'} &nbsp; \u03a3={'+G.T.join(', ')+'} &nbsp; S='+G.S+'<br>'+totalRules+' rules &nbsp; PDA: '+pda.trans.length+' transitions</div>';
+
+  // Quick test buttons
+  const preset=PRESETS.find(p=>p.id===activePreset);
+  const examples=preset?.ex||genDefaultExamples();
+  document.getElementById('quick-btns').innerHTML=examples.slice(0,7).map(s=>
+    '<button onclick="testStr('+JSON.stringify(s)+')" style="font-family:var(--font-mono);font-size:10px;font-weight:700;padding:3px 9px;border-radius:4px;border:1px solid var(--border);color:var(--muted);background:transparent;cursor:pointer;transition:all .15s" onmouseover="this.style.borderColor=\'var(--accent)\';this.style.color=\'var(--accent)\'" onmouseout="this.style.borderColor=\'var(--border)\';this.style.color=\'var(--muted)\'">'+(s===''?EPS_SHOW+' (empty)':escH(s))+'</button>'
+  ).join('');
+}
+
+function genDefaultExamples(){
+  const ex=[''];const T=G.T;
+  if(T[0])ex.push(T[0],T[0]+T[0]);
+  if(T[1])ex.push(T[0]+T[1],T[1]+T[0]);
+  return ex.slice(0,5);
+}
+
+function testStr(s){document.getElementById('sim-input').value=s;startSim();}
+
+function showSidebarSections(){
+  ['notation-sec','pda-sec','sim-sec','trace-sec'].forEach(id=>document.getElementById(id).style.display='');
+  document.getElementById('io-row').style.display='flex';
+}
+
+function clearGrammar(){
+  G=null;pda=null;simSteps=[];simCur=-1;
+  document.getElementById('grammar-card').innerHTML='<em style="color:var(--muted)">No grammar loaded.</em>';
+  document.getElementById('grammar-notation').innerHTML='';
+  ['notation-sec','pda-sec','sim-sec','trace-sec','stack-sec'].forEach(id=>document.getElementById(id).style.display='none');
+  document.getElementById('viewport').innerHTML='';
+  document.getElementById('canvas-hint').style.display='';
+  document.getElementById('canvas-stack').classList.remove('visible');
+  document.getElementById('canvas-tape').classList.remove('visible');
+  setBadge('idle','No grammar loaded');
+  setBar('Create a grammar to begin');
+}
+
+// ══════════════════════════════════════════════════════════
+//  UI HELPERS
+// ══════════════════════════════════════════════════════════
+function setBar(text,tag,info){
+  const el=document.getElementById('bar-text');
+  let html='';
+  if(tag)html+='<span class="canvas-tag">'+escH(tag)+'</span> ';
+  html+=escH(text);
+  if(info)html+=' <span class="bar-info">'+escH(info)+'</span>';
+  el.innerHTML=html;
+}
+
+function setBadge(type,text){
+  const badge=document.getElementById('hdr-badge');
+  const dot=document.getElementById('badge-dot');
+  const txt=document.getElementById('badge-txt');
+  dot.className='dot';
+  if(type==='ok'){dot.classList.add('dot-green');}
+  else if(type==='err'){dot.classList.add('dot-red');}
+  else{dot.classList.add('dot-yellow');}
+  txt.textContent=text;
+}
+
+function toast(msg,type){
+  // Simple inline toast using bar
+  const prev=document.getElementById('bar-text').innerHTML;
+  setBar(msg);
+  setTimeout(()=>document.getElementById('bar-text').innerHTML=prev,1600);
+}
+
+function escH(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ══════════════════════════════════════════════════════════
+//  THEME TOGGLE
+// ══════════════════════════════════════════════════════════
+function toggleTheme(){
+  const root=document.documentElement;
+  const isDark=!root.classList.contains('light');
+  root.classList.toggle('light',isDark);
+  document.getElementById('theme-icon').textContent=isDark?'🌙':'☀';
+  document.getElementById('theme-label').textContent=isDark?'Dark':'Light';
+  // Redraw PDA so SVG node fill colours update
+  if(G&&pda){
+    const cur=simSteps[simCur];
+    drawPDA(cur?cur.state:null,cur&&cur.t?(cur.t.from+cur.t.inp+cur.t.pop+cur.t.to+cur.t.push):null);
+  }
+}
+</script>
+</body>
+</html>
