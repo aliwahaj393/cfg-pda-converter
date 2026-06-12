@@ -41,7 +41,7 @@ If you prefer not to install anything, you can use [Neo4j AuraDB](https://neo4j.
 ## How to Use the Simulator
 
 ### 1. Connecting to the Database
-1. Open the `cfg-pda-tool.html` file in any modern web browser.
+1. Open the `index.html` file in any modern web browser.
 2. In the **Neo4j Database** panel on the left sidebar, enter your Database URI, Username (usually `neo4j`), and Password.
 3. Click **⚡ CONNECT**.
 
